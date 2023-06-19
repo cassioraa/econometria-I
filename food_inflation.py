@@ -398,6 +398,151 @@ plt.show()
 
 # In[ ]:
 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+
+
+class InflationModel:
+    def __init__(self, data_file):
+        self.data_file = data_file
+        self.df = None
+        self.df_aux = None
+        self.H = None
+        self.Phi = None
+        self.Q = None
+        self.R = None
+        self.params = None
+        self.optimized_params = None
+        self.ll = None
+        self.ss = None
+        self.GlobalFactor = None
+        self.factors = None
+    
+    def load_data(self):
+        df = pd.read_excel(self.data_file, sheet_name='fcpi_m')
+        df = df.set_index('Country Code').T
+        df = df.iloc[4:-1]
+        df = df.pct_change(1)*100
+        df = df[['BRA', 'CHL', 'MEX', 'COL', 'USA', 'HUN', 'CHN', 'JPN', 'ZAF']].dropna()
+        df = df.apply(lambda x: x-x.mean())
+        df.index = pd.to_datetime(df.index, format='%Y%m')
+        self.df = df
+    
+    def plot_data(self):
+        ax = self.df.plot(figsize=(15, 5), grid=True, xlabel='Time', ylabel='Food Inflation, % MoM')
+        ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+        plt.show()
+    
+    def kalman_filter(self, y, Phi, Q, H, R):
+        nobs, nvar = y.shape
+        nstates = Phi.shape[0]
+        states = np.zeros((nstates, nobs))
+        xtm1tm1 = np.zeros((nstates, 1))
+        Ptm1tm1 = np.linalg.solve(np.eye(nstates**2) - np.kron(Phi, Phi), Q.reshape((nstates**2, 1))).reshape((nstates, nstates))
+        loglike = 0.0
+        
+        for t in range(nobs):
+            xttm1 = np.dot(Phi, xtm1tm1)
+            Pttm1 = np.dot(np.dot(Phi, Ptm1tm1), Phi.T) + Q
+            xttim1 = xttm1
+            Pttim1 = Pttm1
+            
+            for i in range(nvar):
+                yhat = np.dot(H[i:i+1, :], xttim1)
+                uhat = y[t, i:i+1] - yhat
+                Vhat = np.dot(np.dot(H[i:i+1, :], Pttim1), H[i:i+1, :].T) + R[i, i]
+                
+                if Vhat > 0:
+                    loglike += -0.5 * (np.log(2 * np.pi) + np.log(Vhat) + (uhat**2) / Vhat)
+                
+                K = np.dot(Pttim1, H[i:i+1, :].T) / Vhat
+                xttim1 = xttim1 + np.dot(K, uhat)
+                Pttim1 = Pttim1 - np.dot(np.dot(K, H[i:i+1, :]), Pttim1)
+            
+            xtm1tm1 = xttim1
+            Ptm1tm1 = Pttim1
+            states[:, t] = xtm1tm1.T
+        
+        return loglike, states
+    
+    def diagonal_concat(self, A, B):
+        max_rows = max(A.shape[0], B.shape[0])
+        max_cols = max(A.shape[1], B.shape[1])
+        A_pad = np.pad(A, ((0, max_rows - A.shape[0]), (0, max_cols - A.shape[1])), mode='constant')
+        B_pad = np.pad(B, ((0, max_rows - B.shape[0]), (0, max_cols - B.shape[1])), mode='constant')
+        result = np.block([[A_pad, np.zeros_like(B_pad)],
+                           [np.zeros_like(A_pad), B_pad]])
+        return result
+    
+    def state_space(self, params):
+        n_endog = self.df.shape[1]
+        p = 4
+        H = np.c_[params[:n_endog], np.zeros((n_endog, 3)), np.eye(n_endog)]
+        tmpA = np.r_[params[n_endog:n_endog+p], np.zeros(n_endog)].reshape((1, p+n_endog))
+        tmpB = np.c_[np.eye(p-1), np.zeros((p-1, n_endog+1))]
+        tmpC = np.c_[np.zeros((n_endog, p)), np.diag(params[n_endog+p:2*n_endog+p])]
+        Phi = np.r_[tmpA, tmpB, tmpC]
+        R = np.zeros((n_endog, n_endog))
+        tmp1 = np.zeros((p, p))
+        tmp1[0, 0] = params[2*n_endog+p]**2
+        tmp2 = np.diag(params[-n_endog:]**2)
+        tmp3 = np.c_[tmp1, np.zeros((p, n_endog))]
+        tmp4 = np.c_[np.zeros((n_endog, p)), tmp2]
+        Q = np.r_[tmp3, tmp4]
+        return H, Phi, Q, R
+    
+    def neg_loglike(self, params):
+        H, Phi, Q, R = self.state_space(params)
+        ll, ss = self.kalman_filter(self.df.values, Phi, Q, H, R)
+        return -ll
+    
+    def optimize_parameters(self):
+        method = 'Nelder-Mead'
+        result = minimize(self.neg_loglike, self.params, method=method)
+        self.optimized_params = result.x
+        print("Optimized parameters:\n", self.optimized_params)
+    
+    def calculate_states(self):
+        H, Phi, Q, R = self.state_space(self.optimized_params)
+        ll, ss = self.kalman_filter(self.df.values, Phi, Q, H, R)
+        self.H = H
+        self.Phi = Phi
+        self.Q = Q
+        self.R = R
+        self.ll = ll
+        self.ss = ss
+    
+    def plot_global_factor(self):
+        self.df_aux = self.df.copy()
+        self.df_aux['Global'] = self.ss[0, :]
+        ax = self.df_aux.plot(figsize=(10, 5))
+        ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+        plt.show()
+    
+    def calculate_factors(self):
+        factors = pd.concat([self.ss[0, :] * self.optimized_params[i] for i in range(self.df.shape[1])], axis=1)
+        factors.columns = ['Global_Factor_' + x for x in self.df.columns]
+        self.factors = factors
+    
+    def plot_factors(self):
+        ax = self.factors.plot(figsize=(10, 5))
+        ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+        plt.show()
+
+
+# Usage example
+data_file = 'Inflation-data.xlsx'
+
+inflation_model = InflationModel(data_file)
+inflation_model.load_data()
+inflation_model.plot_data()
+inflation_model.optimize_parameters()
+inflation_model.calculate_states()
+inflation_model.plot_global_factor()
+inflation_model.calculate_factors()
+inflation_model.plot_factors()
 
 
 
